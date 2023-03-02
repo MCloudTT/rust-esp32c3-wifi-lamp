@@ -2,6 +2,7 @@
 #![allow(clippy::single_component_path_imports)]
 //#![feature(backtrace)]
 
+mod mqtt_client;
 #[cfg(all(feature = "qemu", not(esp32)))]
 compile_error!("The `qemu` feature can only be built for the `xtensa-esp32-espidf` target.");
 
@@ -24,24 +25,24 @@ compile_error!(
 
 use core::ffi;
 
+use anyhow::bail;
+use bytes::{Bytes, BytesMut};
+use smart_leds::hsv::Hsv;
+use smol::net::TcpStream as SmolStream;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::prelude::JoinHandleExt;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Condvar, Mutex};
 use std::{cell::RefCell, env, sync::atomic::*, sync::Arc, thread, time::*};
-
-use anyhow::bail;
 
 use log::*;
 
 use url;
 
 use smol;
-
-use embedded_hal::adc::OneShot;
-use embedded_hal::blocking::delay::DelayMs;
-use embedded_hal::digital::v2::OutputPin;
 
 use embedded_svc::eth;
 #[allow(deprecated)]
@@ -77,7 +78,10 @@ use esp_idf_hal::prelude::*;
 use esp_idf_hal::spi;
 
 use esp_idf_sys;
-use esp_idf_sys::{esp, EspError};
+use esp_idf_sys::{
+    esp, esp_random, esp_task_wdt_deinit, esp_task_wdt_reset, esp_task_wdt_status, sleep, EspError,
+    TaskHandle_t,
+};
 
 use display_interface_spi::SPIInterfaceNoCS;
 
@@ -86,12 +90,25 @@ use embedded_graphics::pixelcolor::*;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::*;
 use embedded_graphics::text::*;
+use esp_idf_hal::delay::FreeRtos;
+use esp_idf_hal::reset::WakeupReason::Timer;
+use esp_idf_hal::rmt::config::TransmitConfig;
+use esp_idf_hal::rmt::{FixedLengthSignal, PinState, Pulse, TxRmtDriver};
 
 use mipidsi;
+use mqtt_v5::decoder::decode_mqtt;
+use mqtt_v5::encoder::encode_mqtt;
+use mqtt_v5::topic::Topic;
+use mqtt_v5::types::{ConnectPacket, FinalWill, Packet, SubscribePacket, SubscriptionTopic};
+use serde::{Deserialize, Serialize};
+use smart_leds::hsv::hsv2rgb;
+use smart_leds::SmartLedsWrite;
+use smol::channel::{Receiver, Sender};
+use smol::io::{AsyncReadExt, AsyncWriteExt};
 use ssd1306;
 use ssd1306::mode::DisplayConfig;
-
-use epd_waveshare::{epd4in2::*, graphics::VarDisplay, prelude::*};
+use ws2812_esp32_rmt_driver::driver::color::{LedPixelColorGrb24, LedPixelColorRgbw32};
+use ws2812_esp32_rmt_driver::{LedPixelEsp32Rmt, RGB8, RGBW8};
 
 #[allow(dead_code)]
 #[cfg(not(feature = "qemu"))]
@@ -100,22 +117,60 @@ const SSID: &str = env!("RUST_ESP32_STD_DEMO_WIFI_SSID");
 #[cfg(not(feature = "qemu"))]
 const PASS: &str = env!("RUST_ESP32_STD_DEMO_WIFI_PASS");
 
-#[cfg(esp32s2)]
-include!(env!("EMBUILD_GENERATED_SYMBOLS_FILE"));
-
-#[cfg(esp32s2)]
-const ULP: &[u8] = include_bytes!(env!("EMBUILD_GENERATED_BIN_FILE"));
-
 thread_local! {
     static TLS: RefCell<u32> = RefCell::new(13);
 }
 
 static CS: esp_idf_hal::task::CriticalSection = esp_idf_hal::task::CriticalSection::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum LEDMessage {
+    Color((u8, u8, u8)),
+    Off,
+}
+
+fn spawn_led_controller() {
+    println!("Starting LEDs");
+    let led_pin = 21;
+    let mut ws2812: LedPixelEsp32Rmt<RGB8, LedPixelColorGrb24> =
+        LedPixelEsp32Rmt::new(0, led_pin).unwrap();
+    let (mut sender, receiver) = smol::channel::unbounded::<LEDMessage>();
+    unsafe {
+        esp_task_wdt_deinit();
+    }
+    smol::block_on(async move {
+        smol::spawn(subscribe_to_channel(sender)).detach();
+        smol::spawn(control_led(receiver, ws2812)).detach();
+    });
+    unsafe {
+        sleep(256);
+    }
+}
+
+async fn control_led(
+    receiver: Receiver<LEDMessage>,
+    mut ws2812: LedPixelEsp32Rmt<RGB8, LedPixelColorGrb24>,
+) {
+    loop {
+        match receiver.recv().await {
+            Ok(LEDMessage::Color(c)) => {
+                let color = [c; 20];
+                ws2812.write(color.iter().map(|c| c.clone())).unwrap();
+            }
+            Ok(LEDMessage::Off) => {
+                let color = [RGB8::default(); 20];
+                ws2812.write(color.iter().map(|c| c.clone())).unwrap();
+            }
+            Err(_) => {
+                continue;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn main() -> Result<()> {
     esp_idf_sys::link_patches();
-
-    test_print();
 
     test_atomics();
 
@@ -127,34 +182,10 @@ fn main() -> Result<()> {
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    // Get backtraces from anyhow; only works for Xtensa arch currently
-    // TODO: No longer working with ESP-IDF 4.3.1+
-    //#[cfg(target_arch = "xtensa")]
-    //env::set_var("RUST_BACKTRACE", "1");
-
     #[allow(unused)]
     let peripherals = Peripherals::take().unwrap();
     #[allow(unused)]
     let pins = peripherals.pins;
-
-    // If interrupt critical sections work fine, the code below should panic with the IWDT triggering
-    // {
-    //     info!("Testing interrupt critical sections");
-
-    //     let mut x = 0;
-
-    //     esp_idf_hal::interrupt::free(move || {
-    //         for _ in 0..2000000 {
-    //             for _ in 0..2000000 {
-    //                 x += 1;
-
-    //                 if x == 1000000 {
-    //                     break;
-    //                 }
-    //             }
-    //         }
-    //     });
-    // }
 
     {
         info!("Testing critical sections");
@@ -170,7 +201,7 @@ fn main() -> Result<()> {
                     info!("Critical section acquired");
                 });
 
-                std::thread::sleep(Duration::from_secs(5));
+                thread::sleep(Duration::from_secs(5));
 
                 th
             };
@@ -182,130 +213,10 @@ fn main() -> Result<()> {
     #[allow(unused)]
     let sysloop = EspSystemEventLoop::take()?;
 
-    #[cfg(feature = "ttgo")]
-    ttgo_hello_world(
-        pins.gpio4,
-        pins.gpio16,
-        pins.gpio23,
-        peripherals.spi2,
-        pins.gpio18,
-        pins.gpio19,
-        pins.gpio5,
-    )?;
-
-    #[cfg(feature = "waveshare_epd")]
-    waveshare_epd_hello_world(
-        peripherals.spi2,
-        pins.gpio13.into(),
-        pins.gpio14.into(),
-        pins.gpio15.into(),
-        pins.gpio25.into(),
-        pins.gpio27.into(),
-        pins.gpio26.into(),
-    )?;
-
-    #[cfg(feature = "kaluga")]
-    kaluga_hello_world(
-        pins.gpio6,
-        pins.gpio13,
-        pins.gpio16,
-        peripherals.spi3,
-        pins.gpio15,
-        pins.gpio9,
-        pins.gpio11,
-    )?;
-
-    #[cfg(feature = "heltec")]
-    heltec_hello_world(pins.gpio16, peripherals.i2c0, pins.gpio4, pins.gpio15)?;
-
-    #[cfg(feature = "ssd1306g_spi")]
-    ssd1306g_hello_world_spi(
-        pins.gpio4.into(),
-        pins.gpio16.into(),
-        peripherals.spi3,
-        pins.gpio18.into(),
-        pins.gpio23.into(),
-        pins.gpio5.into(),
-    )?;
-
-    #[cfg(feature = "ssd1306g")]
-    let mut led_power = ssd1306g_hello_world(
-        peripherals.i2c0,
-        pins.gpio14.into(),
-        pins.gpio22.into(),
-        pins.gpio21.into(),
-    )?;
-
-    #[cfg(feature = "esp32s3_usb_otg")]
-    esp32s3_usb_otg_hello_world(
-        pins.gpio9,
-        pins.gpio4,
-        pins.gpio8,
-        peripherals.spi3,
-        pins.gpio6,
-        pins.gpio7,
-        pins.gpio5,
-    )?;
-
     #[allow(clippy::redundant_clone)]
     #[cfg(not(feature = "qemu"))]
     #[allow(unused_mut)]
     let mut wifi = wifi(peripherals.modem, sysloop.clone())?;
-
-    #[allow(clippy::redundant_clone)]
-    #[cfg(feature = "qemu")]
-    let eth = eth_configure(
-        &sysloop,
-        Box::new(esp_idf_svc::eth::EspEth::wrap(
-            esp_idf_svc::eth::EthDriver::new_openeth(peripherals.mac, sysloop.clone())?,
-        )?),
-    )?;
-
-    #[allow(clippy::redundant_clone)]
-    #[cfg(feature = "ip101")]
-    let eth = eth_configure(
-        &sysloop,
-        Box::new(esp_idf_svc::eth::EspEth::wrap(
-            esp_idf_svc::eth::EthDriver::new_rmii(
-                peripherals.mac,
-                pins.gpio25,
-                pins.gpio26,
-                pins.gpio27,
-                pins.gpio23,
-                pins.gpio22,
-                pins.gpio21,
-                pins.gpio19,
-                pins.gpio18,
-                RmiiClockConfig::<gpio::Gpio0, gpio::Gpio16, gpio::Gpio17>::Input(pins.gpio0),
-                Some(pins.gpio5),
-                esp_idf_svc::eth::RmiiEthChipset::IP101,
-                None,
-                sysloop.clone(),
-            )?,
-        )?),
-    )?;
-
-    #[cfg(feature = "w5500")]
-    let eth = eth_configure(
-        &sysloop,
-        Box::new(esp_idf_svc::eth::EspEth::wrap(
-            esp_idf_svc::eth::EthDriver::new_spi(
-                peripherals.spi2,
-                pins.gpio13,
-                pins.gpio12,
-                pins.gpio26,
-                pins.gpio27,
-                esp_idf_hal::spi::Dma::Auto(4096),
-                Some(pins.gpio14),
-                Some(pins.gpio25),
-                esp_idf_svc::eth::SpiEthChipset::W5500,
-                20.MHz().into(),
-                Some(&[0x02, 0x00, 0x00, 0x12, 0x34, 0x56]),
-                None,
-                sysloop.clone(),
-            )?,
-        )?),
-    )?;
 
     test_tcp()?;
 
@@ -316,12 +227,11 @@ fn main() -> Result<()> {
 
     let (eventloop, _subscription) = test_eventloop()?;
 
-    let mqtt_client = test_mqtt_client()?;
-
-    let _timer = test_timer(eventloop, mqtt_client)?;
-
     #[cfg(feature = "experimental")]
     experimental::test()?;
+
+    // Start LED controller
+    spawn_led_controller();
 
     #[cfg(not(feature = "qemu"))]
     #[cfg(esp_idf_lwip_ipv4_napt)]
@@ -331,23 +241,8 @@ fn main() -> Result<()> {
 
     let httpd = httpd(mutex.clone())?;
 
-    #[cfg(feature = "ssd1306g")]
-    {
-        for s in 0..3 {
-            info!("Powering off the display in {} secs", 3 - s);
-            thread::sleep(Duration::from_secs(1));
-        }
-
-        led_power.set_low()?;
-    }
-
     let mut wait = mutex.0.lock().unwrap();
 
-    #[cfg(all(esp32, esp_idf_version_major = "4"))]
-    let mut hall_sensor = peripherals.hall_sensor;
-
-    #[cfg(esp32)]
-    let adc_pin = pins.gpio34;
     #[cfg(any(esp32s2, esp32s3, esp32c3))]
     let adc_pin = pins.gpio2;
 
@@ -368,12 +263,6 @@ fn main() -> Result<()> {
                 .wait_timeout(wait, Duration::from_secs(1))
                 .unwrap()
                 .0;
-
-            #[cfg(all(esp32, esp_idf_version_major = "4"))]
-            log::info!(
-                "Hall sensor reading: {}mV",
-                powered_adc1.read_hall(&mut hall_sensor).unwrap()
-            );
             log::info!(
                 "A2 sensor reading: {}mV",
                 powered_adc1.read(&mut a2).unwrap()
@@ -394,15 +283,6 @@ fn main() -> Result<()> {
         drop(wifi);
         info!("Wifi stopped");
     }
-
-    #[cfg(any(feature = "qemu", feature = "w5500", feature = "ip101"))]
-    {
-        drop(eth);
-        info!("Eth stopped");
-    }
-
-    #[cfg(esp32s2)]
-    start_ulp(peripherals.ulp, cycles)?;
 
     Ok(())
 }
@@ -659,57 +539,6 @@ fn test_eventloop() -> Result<(EspBackgroundEventLoop, EspBackgroundSubscription
     })?;
 
     Ok((eventloop, subscription))
-}
-
-fn test_mqtt_client() -> Result<EspMqttClient<ConnState<MessageImpl, EspError>>> {
-    info!("About to start MQTT client");
-
-    let conf = MqttClientConfiguration {
-        client_id: Some("rust-esp32-std-demo"),
-        crt_bundle_attach: Some(esp_idf_sys::esp_crt_bundle_attach),
-
-        ..Default::default()
-    };
-
-    let (mut client, mut connection) =
-        EspMqttClient::new_with_conn("mqtts://broker.emqx.io:8883", &conf)?;
-
-    info!("MQTT client started");
-
-    // Need to immediately start pumping the connection for messages, or else subscribe() and publish() below will not work
-    // Note that when using the alternative constructor - `EspMqttClient::new` - you don't need to
-    // spawn a new thread, as the messages will be pumped with a backpressure into the callback you provide.
-    // Yet, you still need to efficiently process each message in the callback without blocking for too long.
-    //
-    // Note also that if you go to http://tools.emqx.io/ and then connect and send a message to topic
-    // "rust-esp32-std-demo", the client configured here should receive it.
-    thread::spawn(move || {
-        info!("MQTT Listening for messages");
-
-        while let Some(msg) = connection.next() {
-            match msg {
-                Err(e) => info!("MQTT Message ERROR: {}", e),
-                Ok(msg) => info!("MQTT Message: {:?}", msg),
-            }
-        }
-
-        info!("MQTT connection loop exit");
-    });
-
-    client.subscribe("rust-esp32-std-demo", QoS::AtMostOnce)?;
-
-    info!("Subscribed to all topics (rust-esp32-std-demo)");
-
-    client.publish(
-        "rust-esp32-std-demo",
-        QoS::AtMostOnce,
-        false,
-        "Hello from rust-esp32-std-demo!".as_bytes(),
-    )?;
-
-    info!("Published a hello message to topic \"rust-esp32-std-demo\"");
-
-    Ok(client)
 }
 
 #[cfg(feature = "experimental")]
@@ -1124,59 +953,7 @@ fn httpd(mutex: Arc<(Mutex<Option<u32>>, Condvar)>) -> Result<idf::Server> {
         .at("/panic")
         .get(|_| panic!("User requested a panic!"))?;
 
-    #[cfg(esp32s2)]
-    let server = httpd_ulp_endpoints(server, mutex)?;
-
     server.start(&Default::default())
-}
-
-#[cfg(all(esp32s2, not(feature = "experimental")))]
-fn httpd_ulp_endpoints(
-    server: ServerRegistry,
-    mutex: Arc<(Mutex<Option<u32>>, Condvar)>,
-) -> Result<ServerRegistry> {
-    server
-        .at("/ulp")
-        .get(|_| {
-            Ok(r#"
-            <doctype html5>
-            <html>
-                <body>
-                    <form method = "post" action = "/ulp_start" enctype="application/x-www-form-urlencoded">
-                        Connect a LED to ESP32-S2 GPIO <b>Pin 04</b> and GND.<br>
-                        Blink it with ULP <input name = "cycles" type = "text" value = "10"> times
-                        <input type = "submit" value = "Go!">
-                    </form>
-                </body>
-            </html>
-            "#.into())
-        })?
-        .at("/ulp_start")
-        .post(move |mut request| {
-            let body = request.as_bytes()?;
-
-            let cycles = url::form_urlencoded::parse(&body)
-                .filter(|p| p.0 == "cycles")
-                .map(|p| str::parse::<u32>(&p.1).map_err(Error::msg))
-                .next()
-                .ok_or(anyhow::anyhow!("No parameter cycles"))??;
-
-            let mut wait = mutex.0.lock().unwrap();
-
-            *wait = Some(cycles);
-            mutex.1.notify_one();
-
-            Ok(format!(
-                r#"
-                <doctype html5>
-                <html>
-                    <body>
-                        About to sleep now. The ULP chip should blink the LED {} times and then wake me up. Bye!
-                    </body>
-                </html>
-                "#,
-                cycles).to_owned().into())
-        })
 }
 
 #[allow(unused_variables)]
@@ -1274,104 +1051,7 @@ fn httpd(
             }))),
         )?;
 
-    #[cfg(esp32s2)]
-    httpd_ulp_endpoints(&mut server, mutex)?;
-
     Ok(server)
-}
-
-#[cfg(all(esp32s2, feature = "experimental"))]
-fn httpd_ulp_endpoints(
-    server: &mut esp_idf_svc::http::server::EspHttpServer,
-    mutex: Arc<(Mutex<Option<u32>>, Condvar)>,
-) -> Result<()> {
-    use embedded_svc::http::server::registry::Registry;
-    use embedded_svc::http::server::{Request, Response};
-    use embedded_svc::io::adapters::ToStd;
-
-    server
-        .handle_get("/ulp", |_req, resp| {
-            resp.send_str(
-            r#"
-            <doctype html5>
-            <html>
-                <body>
-                    <form method = "post" action = "/ulp_start" enctype="application/x-www-form-urlencoded">
-                        Connect a LED to ESP32-S2 GPIO <b>Pin 04</b> and GND.<br>
-                        Blink it with ULP <input name = "cycles" type = "text" value = "10"> times
-                        <input type = "submit" value = "Go!">
-                    </form>
-                </body>
-            </html>
-            "#)?;
-
-            Ok(())
-        })?
-        .handle_post("/ulp_start", move |mut req, resp| {
-            let mut body = Vec::new();
-
-            ToStd::new(req.reader()).read_to_end(&mut body)?;
-
-            let cycles = url::form_urlencoded::parse(&body)
-                .filter(|p| p.0 == "cycles")
-                .map(|p| str::parse::<u32>(&p.1).map_err(Error::msg))
-                .next()
-                .ok_or(anyhow::anyhow!("No parameter cycles"))??;
-
-            let mut wait = mutex.0.lock().unwrap();
-
-            *wait = Some(cycles);
-            mutex.1.notify_one();
-
-            resp.send_str(
-                &format!(
-                r#"
-                <doctype html5>
-                <html>
-                    <body>
-                        About to sleep now. The ULP chip should blink the LED {} times and then wake me up. Bye!
-                    </body>
-                </html>
-                "#,
-                cycles))?;
-
-            Ok(())
-        })?;
-
-    Ok(())
-}
-
-#[cfg(esp32s2)]
-fn start_ulp(mut ulp: esp_idf_hal::ulp::ULP, cycles: u32) -> Result<()> {
-    let cycles_var = CYCLES as *mut u32;
-
-    unsafe {
-        ulp.load(ULP)?;
-        info!("RiscV ULP binary loaded successfully");
-
-        info!(
-            "Default ULP LED blink cycles: {}",
-            ulp.read_var(cycles_var)?
-        );
-
-        ulp.write_var(cycles_var, cycles)?;
-        info!(
-            "Sent {} LED blink cycles to the ULP",
-            ulp.read_var(cycles_var)?
-        );
-
-        ulp.start()?;
-        info!("RiscV ULP started");
-
-        esp!(esp_idf_sys::esp_sleep_enable_ulp_wakeup())?;
-        info!("Wakeup from ULP enabled");
-
-        // Wake up by a timer in 60 seconds
-        info!("About to get to sleep now. Will wake up automatically either in 1 minute, or once the ULP has done blinking the LED");
-        esp_idf_sys::esp_deep_sleep(Duration::from_secs(60).as_micros() as u64);
-    }
-
-    Ok(())
 }
 
 #[cfg(not(feature = "qemu"))]
@@ -1453,42 +1133,6 @@ fn wifi(
     Ok(wifi)
 }
 
-#[cfg(any(feature = "qemu", feature = "w5500", feature = "ip101"))]
-fn eth_configure(
-    sysloop: &EspSystemEventLoop,
-    mut eth: Box<esp_idf_svc::eth::EspEth<'static>>,
-) -> Result<Box<esp_idf_svc::eth::EspEth<'static>>> {
-    use std::net::Ipv4Addr;
-
-    info!("Eth created");
-
-    eth.start()?;
-
-    info!("Starting eth...");
-
-    if !esp_idf_svc::eth::EthWait::new(eth.driver(), sysloop)?
-        .wait_with_timeout(Duration::from_secs(20), || eth.is_started().unwrap())
-    {
-        bail!("Eth did not start");
-    }
-
-    if !EspNetifWait::new::<EspNetif>(eth.netif(), &sysloop)?
-        .wait_with_timeout(Duration::from_secs(20), || {
-            eth.netif().get_ip_info().unwrap().ip != Ipv4Addr::new(0, 0, 0, 0)
-        })
-    {
-        bail!("Eth did not receive a DHCP lease");
-    }
-
-    let ip_info = eth.netif().get_ip_info()?;
-
-    info!("Eth DHCP info: {:?}", ip_info);
-
-    ping(ip_info.subnet.gateway)?;
-
-    Ok(eth)
-}
-
 fn ping(ip: ipv4::Ipv4Addr) -> Result<()> {
     info!("About to do some pings for {:?}", ip);
 
@@ -1508,56 +1152,6 @@ fn enable_napt(wifi: &mut EspWifi) -> Result<()> {
     wifi.ap_netif_mut().enable_napt(true);
 
     info!("NAPT enabled on the WiFi SoftAP!");
-
-    Ok(())
-}
-
-#[cfg(feature = "waveshare_epd")]
-fn waveshare_epd_hello_world(
-    spi: impl peripheral::Peripheral<P = impl spi::SpiAnyPins> + 'static,
-    sclk: gpio::AnyOutputPin,
-    sdo: gpio::AnyOutputPin,
-    cs: gpio::AnyOutputPin,
-    busy_in: gpio::AnyInputPin,
-    dc: gpio::AnyOutputPin,
-    rst: gpio::AnyOutputPin,
-) -> Result<()> {
-    info!("About to initialize Waveshare 4.2 e-paper display");
-
-    let mut driver = spi::SpiDeviceDriver::new_single(
-        spi,
-        sclk,
-        sdo,
-        Option::<gpio::AnyIOPin>::None,
-        spi::Dma::Disabled,
-        Option::<gpio::AnyOutputPin>::None,
-        &spi::SpiConfig::new().baudrate(26.MHz().into()),
-    )?;
-
-    // Setup EPD
-    let mut epd = Epd4in2::new(
-        &mut driver,
-        gpio::PinDriver::output(cs)?,
-        gpio::PinDriver::input(busy_in)?,
-        gpio::PinDriver::output(dc)?,
-        gpio::PinDriver::output(rst)?,
-        &mut delay::Ets,
-    )
-    .unwrap();
-
-    // Use display graphics from embedded-graphics
-    let mut buffer =
-        vec![DEFAULT_BACKGROUND_COLOR.get_byte_value(); WIDTH as usize / 8 * HEIGHT as usize];
-    let mut display = VarDisplay::new(WIDTH, HEIGHT, &mut buffer);
-
-    let style = MonoTextStyle::new(&FONT_10X20, BinaryColor::On);
-
-    // Create a text at position (20, 30) and draw it using the previously defined style
-    Text::new("Hello Rust!", Point::new(20, 30), style).draw(&mut display)?;
-
-    // Display updated frame
-    epd.update_frame(&mut driver, &display.buffer(), &mut delay::Ets)?;
-    epd.display_frame(&mut driver, &mut delay::Ets)?;
 
     Ok(())
 }
