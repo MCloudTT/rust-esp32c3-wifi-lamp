@@ -2,6 +2,8 @@
 #![allow(clippy::single_component_path_imports)]
 //#![feature(backtrace)]
 
+extern crate core;
+
 mod mqtt_client;
 #[cfg(all(feature = "qemu", not(esp32)))]
 compile_error!("The `qemu` feature can only be built for the `xtensa-esp32-espidf` target.");
@@ -28,9 +30,8 @@ use core::ffi;
 use anyhow::bail;
 use bytes::{Bytes, BytesMut};
 use smart_leds::hsv::Hsv;
-use smol::net::TcpStream as SmolStream;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read as StdRead, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::prelude::JoinHandleExt;
 use std::path::PathBuf;
@@ -90,11 +91,15 @@ use embedded_graphics::pixelcolor::*;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::*;
 use embedded_graphics::text::*;
+use embedded_svc::http::Headers;
+use embedded_svc::io::Read;
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::reset::WakeupReason::Timer;
 use esp_idf_hal::rmt::config::TransmitConfig;
 use esp_idf_hal::rmt::{FixedLengthSignal, PinState, Pulse, TxRmtDriver};
+use esp_idf_svc::handle::RawHandle;
 
+use crate::mqtt_client::subscribe_to_channel;
 use mipidsi;
 use mqtt_v5::decoder::decode_mqtt;
 use mqtt_v5::encoder::encode_mqtt;
@@ -124,27 +129,23 @@ thread_local! {
 static CS: esp_idf_hal::task::CriticalSection = esp_idf_hal::task::CriticalSection::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum LEDMessage {
+pub enum LEDMessage {
     Color((u8, u8, u8)),
     Off,
 }
 
-fn spawn_led_controller() {
+fn spawn_led_controller() -> Sender<LEDMessage> {
     println!("Starting LEDs");
     let led_pin = 21;
     let mut ws2812: LedPixelEsp32Rmt<RGB8, LedPixelColorGrb24> =
         LedPixelEsp32Rmt::new(0, led_pin).unwrap();
     let (mut sender, receiver) = smol::channel::unbounded::<LEDMessage>();
-    unsafe {
-        esp_task_wdt_deinit();
-    }
+    let cloned_sender = sender.clone();
     smol::block_on(async move {
-        smol::spawn(subscribe_to_channel(sender)).detach();
+        smol::spawn(subscribe_to_channel(cloned_sender)).detach();
         smol::spawn(control_led(receiver, ws2812)).detach();
     });
-    unsafe {
-        sleep(256);
-    }
+    sender
 }
 
 async fn control_led(
@@ -154,6 +155,7 @@ async fn control_led(
     loop {
         match receiver.recv().await {
             Ok(LEDMessage::Color(c)) => {
+                println!("Got {:?}", c);
                 let color = [c; 20];
                 ws2812.write(color.iter().map(|c| c.clone())).unwrap();
             }
@@ -231,15 +233,14 @@ fn main() -> Result<()> {
     experimental::test()?;
 
     // Start LED controller
-    spawn_led_controller();
-
-    #[cfg(not(feature = "qemu"))]
-    #[cfg(esp_idf_lwip_ipv4_napt)]
-    enable_napt(&mut wifi)?;
-
+    let led_sender = spawn_led_controller();
+    println!(
+        "This is an example of a json serialized color: {:?}",
+        serde_json::to_string(&LEDMessage::Color((255, 0, 0))).unwrap()
+    );
     let mutex = Arc::new((Mutex::new(None), Condvar::new()));
 
-    let httpd = httpd(mutex.clone())?;
+    let httpd = httpd(mutex.clone(), led_sender)?;
 
     let mut wait = mutex.0.lock().unwrap();
 
@@ -960,6 +961,7 @@ fn httpd(mutex: Arc<(Mutex<Option<u32>>, Condvar)>) -> Result<idf::Server> {
 #[cfg(feature = "experimental")]
 fn httpd(
     mutex: Arc<(Mutex<Option<u32>>, Condvar)>,
+    sender: Sender<LEDMessage>,
 ) -> Result<esp_idf_svc::http::server::EspHttpServer> {
     use embedded_svc::http::server::{
         Connection, Handler, HandlerResult, Method, Middleware, Query, Request, Response,
@@ -1033,6 +1035,28 @@ fn httpd(
             Ok(())
         })?
         .fn_handler("/panic", Method::Get, |_| panic!("User requested a panic!"))?
+        .fn_handler("/color", Method::Post, move |mut req| {
+            println!("Got request {:?}", req.content_len());
+            let len = req.content_len().unwrap() as usize;
+            let mut read_buf = [0u8; 512];
+            req.split().1.read(&mut read_buf)?;
+            println!("Read: {:?}", read_buf);
+            match serde_json::from_slice::<LEDMessage>(&read_buf.as_ref()[..len]) {
+                Ok(message) => {
+                    smol::block_on(async {
+                        sender.send(message).await.unwrap();
+                    });
+                    req.into_ok_response()?
+                        .write_all("Color changed!".as_bytes())?;
+                }
+                Err(e) => {
+                    println!("Failed to parse message: {:?}", e);
+                    req.into_response(400, Some("Bad request"), &[])?
+                        .write_all("Failed to parse message".as_bytes())?;
+                }
+            }
+            Ok(())
+        })?
         .handler(
             "/middleware",
             Method::Get,
